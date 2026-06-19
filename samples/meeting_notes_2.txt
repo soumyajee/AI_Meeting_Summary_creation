@@ -1,0 +1,15 @@
+Deployment planning meeting
+
+Attendees: Anita, David, Emily
+
+Summary: Deployment schedule, environment readiness, and release approvals were discussed.
+
+Action: Anita to verify deployment checklist.
+Action: David to coordinate deployment testing.
+Decision: Deploy to staging first, then production after sign-off.
+Risk: Production rollback plan is not finalized.
+
+Discussion:
+- Emily: We need to confirm payment integration before deployment.
+- Anita: Subscription testing should be completed by Tuesday.
+- David: Deployment scripts will be reviewed in tomorrow's standup.

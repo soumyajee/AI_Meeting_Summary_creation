@@ -1,0 +1,15 @@
+Project kickoff meeting
+
+Attendees: Alice, Bob, Carla
+
+Summary: We agreed on initial feature scope, timeline, and next steps.
+
+Action: Alice to finalize project requirements by Friday.
+Action: Bob to review technical architecture.
+Decision: Use Python and FastAPI for the backend.
+Risk: Tight delivery timeline may require overtime.
+
+Discussion:
+- Alice: We need an MVP with transcript analysis, action items, and follow-up email.
+- Bob: We should store meeting metadata and allow searching previous meetings.
+- Carla: We need QA support for asking who owns tasks.
