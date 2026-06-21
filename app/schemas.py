@@ -1,10 +1,11 @@
 from typing import List, Optional
-from pydantic import BaseModel
+
+from pydantic import BaseModel, Field
 
 
 class AnalyzeRequest(BaseModel):
     title: Optional[str] = None
-    transcript: str
+    transcript: str = Field(..., min_length=1)
 
 
 class AnalyzeResponse(BaseModel):
@@ -17,11 +18,11 @@ class AnalyzeResponse(BaseModel):
 
 class QARequest(BaseModel):
     meeting_id: Optional[int] = None
-    question: str
+    question: str = Field(..., min_length=1)
 
 
 class SearchRequest(BaseModel):
-    query: str
+    query: str = Field(..., min_length=1)
 
 
 class SearchResponse(BaseModel):
@@ -30,12 +31,11 @@ class SearchResponse(BaseModel):
 
 
 class FollowupRequest(BaseModel):
-    meeting_id: Optional[int] = None
-    transcript: Optional[str] = None
+    meeting_id: int
 
 
 class MultiMeetingInsightRequest(BaseModel):
-    query: str
+    query: str = Field(..., min_length=1)
     meeting_ids: Optional[List[int]] = None
 
 
