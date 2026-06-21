@@ -1,32 +1,63 @@
+import hashlib
 import json
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, UploadFile, File, HTTPException, Depends
+from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from sqlmodel import Session, select
 
 from .db import get_session
-from .models import Meeting, ActionItem, Decision, Risk, TranscriptChunk
-from .schemas import (
-    AnalyzeRequest,
-    QARequest,
-    SearchRequest,
-    FollowupRequest,
-    MultiMeetingInsightRequest,
-    UpdateActionItemRequest,
-)
-from .utils import read_upload_file, chunk_transcript
 from .llm import (
     analyze_transcript,
     answer_meeting_question,
-    generate_followup_email,
     consolidate_meeting_insights,
+    generate_followup_email,
 )
+from .models import ActionItem, Decision, Meeting, Risk, TranscriptChunk
+from .schemas import (
+    AnalyzeRequest,
+    FollowupRequest,
+    MultiMeetingInsightRequest,
+    QARequest,
+    SearchRequest,
+    UpdateActionItemRequest,
+)
+from .utils import chunk_transcript, read_upload_file
 
 
 router = APIRouter(
     prefix="/meetings",
     tags=["Meetings"],
 )
+
+
+# -------------------------------------------------------------------
+# Text / Duplicate Helpers
+# -------------------------------------------------------------------
+
+def normalize_transcript_for_hash(transcript: str) -> str:
+    return " ".join((transcript or "").lower().split())
+
+
+def get_transcript_hash(transcript: str) -> str:
+    normalized = normalize_transcript_for_hash(transcript)
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
+def is_same_transcript(existing_transcript: str, new_transcript: str) -> bool:
+    return get_transcript_hash(existing_transcript) == get_transcript_hash(new_transcript)
+
+
+def find_duplicate_meeting(
+    session: Session,
+    transcript: str,
+) -> Optional[Meeting]:
+    meetings = session.exec(select(Meeting)).all()
+
+    for meeting in meetings:
+        if is_same_transcript(meeting.transcript, transcript):
+            return meeting
+
+    return None
 
 
 def normalize_text(value: Any) -> str:
@@ -41,9 +72,9 @@ def normalize_text(value: Any) -> str:
             or value.get("concern")
             or value.get("task")
             or json.dumps(value)
-        )
+        ).strip()
 
-    return str(value)
+    return str(value).strip()
 
 
 def normalize_action_item(item: Any) -> Dict[str, Any]:
@@ -61,8 +92,17 @@ def normalize_action_item(item: Any) -> Dict[str, Any]:
     }
 
 
-def save_transcript_chunks(session: Session, meeting_id: int, transcript: str) -> None:
+# -------------------------------------------------------------------
+# Database Save / Retrieve Helpers
+# -------------------------------------------------------------------
+
+def save_transcript_chunks(
+    session: Session,
+    meeting_id: int,
+    transcript: str,
+) -> None:
     chunks = chunk_transcript(transcript)
+
     start_pos = 0
 
     for chunk_text in chunks:
@@ -73,6 +113,7 @@ def save_transcript_chunks(session: Session, meeting_id: int, transcript: str) -
                 start_pos=start_pos,
             )
         )
+
         start_pos += len(chunk_text)
 
 
@@ -82,6 +123,14 @@ def save_analysis_to_db(
     transcript: str,
     analysis: Dict[str, Any],
 ) -> Meeting:
+    duplicate_meeting = find_duplicate_meeting(
+        session=session,
+        transcript=transcript,
+    )
+
+    if duplicate_meeting:
+        return duplicate_meeting
+
     meeting = Meeting(
         title=title,
         transcript=transcript,
@@ -97,50 +146,90 @@ def save_analysis_to_db(
 
     meeting_id = meeting.id
 
+    seen_action_items = set()
+
     for raw_item in analysis.get("action_items", []):
         item = normalize_action_item(raw_item)
 
-        if item["task"]:
-            session.add(
-                ActionItem(
-                    meeting_id=meeting_id,
-                    owner=item["owner"],
-                    task=item["task"],
-                    completed=item["completed"],
-                )
+        owner = (item["owner"] or "Unassigned").strip()
+        task = (item["task"] or "").strip()
+
+        if not task:
+            continue
+
+        action_key = (owner.lower(), task.lower())
+
+        if action_key in seen_action_items:
+            continue
+
+        seen_action_items.add(action_key)
+
+        session.add(
+            ActionItem(
+                meeting_id=meeting_id,
+                owner=owner,
+                task=task,
+                completed=bool(item["completed"]),
             )
+        )
+
+    seen_decisions = set()
 
     for raw_decision in analysis.get("decisions", []):
         decision_text = normalize_text(raw_decision)
 
-        if decision_text:
-            session.add(
-                Decision(
-                    meeting_id=meeting_id,
-                    text=decision_text,
-                )
-            )
+        if not decision_text:
+            continue
 
-    risks = []
+        decision_key = decision_text.lower()
+
+        if decision_key in seen_decisions:
+            continue
+
+        seen_decisions.add(decision_key)
+
+        session.add(
+            Decision(
+                meeting_id=meeting_id,
+                text=decision_text,
+            )
+        )
+
+    risk_values = []
 
     if isinstance(analysis.get("risks"), list):
-        risks.extend(analysis.get("risks", []))
+        risk_values.extend(analysis.get("risks", []))
 
     if isinstance(analysis.get("concerns"), list):
-        risks.extend(analysis.get("concerns", []))
+        risk_values.extend(analysis.get("concerns", []))
 
-    for raw_risk in risks:
+    seen_risks = set()
+
+    for raw_risk in risk_values:
         risk_text = normalize_text(raw_risk)
 
-        if risk_text:
-            session.add(
-                Risk(
-                    meeting_id=meeting_id,
-                    text=risk_text,
-                )
-            )
+        if not risk_text:
+            continue
 
-    save_transcript_chunks(session, meeting_id, transcript)
+        risk_key = risk_text.lower()
+
+        if risk_key in seen_risks:
+            continue
+
+        seen_risks.add(risk_key)
+
+        session.add(
+            Risk(
+                meeting_id=meeting_id,
+                text=risk_text,
+            )
+        )
+
+    save_transcript_chunks(
+        session=session,
+        meeting_id=meeting_id,
+        transcript=transcript,
+    )
 
     session.commit()
     session.refresh(meeting)
@@ -148,11 +237,19 @@ def save_analysis_to_db(
     return meeting
 
 
-def get_meeting_details(session: Session, meeting_id: int) -> Dict[str, Any]:
+def get_meeting_details(
+    session: Session,
+    meeting_id: int,
+    include_chunks: bool = False,
+    include_transcript: bool = True,
+) -> Dict[str, Any]:
     meeting = session.get(Meeting, meeting_id)
 
     if not meeting:
-        raise HTTPException(status_code=404, detail="Meeting not found.")
+        raise HTTPException(
+            status_code=404,
+            detail="Meeting not found.",
+        )
 
     action_items = session.exec(
         select(ActionItem).where(ActionItem.meeting_id == meeting_id)
@@ -166,14 +263,9 @@ def get_meeting_details(session: Session, meeting_id: int) -> Dict[str, Any]:
         select(Risk).where(Risk.meeting_id == meeting_id)
     ).all()
 
-    chunks = session.exec(
-        select(TranscriptChunk).where(TranscriptChunk.meeting_id == meeting_id)
-    ).all()
-
-    return {
+    data = {
         "id": meeting.id,
         "title": meeting.title,
-        "transcript": meeting.transcript,
         "summary": meeting.summary,
         "action_items": [
             {
@@ -198,25 +290,53 @@ def get_meeting_details(session: Session, meeting_id: int) -> Dict[str, Any]:
             }
             for risk in risks
         ],
-        "chunks": [
+    }
+
+    if include_transcript:
+        data["transcript"] = meeting.transcript
+
+    if include_chunks:
+        chunks = session.exec(
+            select(TranscriptChunk).where(TranscriptChunk.meeting_id == meeting_id)
+        ).all()
+
+        data["chunks"] = [
             {
                 "id": chunk.id,
                 "text": chunk.text,
                 "start_pos": chunk.start_pos,
             }
             for chunk in chunks
-        ],
-    }
+        ]
+
+    return data
 
 
-def build_meeting_context(session: Session, meetings: List[Meeting]) -> str:
+def build_meeting_context(
+    session: Session,
+    meetings: List[Meeting],
+) -> str:
     context_parts = []
+
+    seen_hashes = set()
 
     for meeting in meetings:
         if meeting.id is None:
             continue
 
-        details = get_meeting_details(session, meeting.id)
+        transcript_hash = get_transcript_hash(meeting.transcript)
+
+        if transcript_hash in seen_hashes:
+            continue
+
+        seen_hashes.add(transcript_hash)
+
+        details = get_meeting_details(
+            session=session,
+            meeting_id=meeting.id,
+            include_chunks=False,
+            include_transcript=True,
+        )
 
         context_parts.append(
             f"""
@@ -242,6 +362,10 @@ Risks:
 
     return "\n\n---\n\n".join(context_parts)
 
+
+# -------------------------------------------------------------------
+# Search Helpers
+# -------------------------------------------------------------------
 
 def expand_search_terms(query: str) -> List[str]:
     raw_query = query.lower().strip()
@@ -311,6 +435,42 @@ def expand_search_terms(query: str) -> List[str]:
     return sorted(expanded_terms)
 
 
+def make_snippet(
+    text: str,
+    matched_terms: List[str],
+    size: int = 180,
+) -> str:
+    if not text:
+        return ""
+
+    lower_text = text.lower()
+
+    first_index = -1
+
+    for term in matched_terms:
+        index = lower_text.find(term.lower())
+
+        if index != -1:
+            first_index = index
+            break
+
+    if first_index == -1:
+        return text[:size] + ("..." if len(text) > size else "")
+
+    start = max(first_index - 60, 0)
+    end = min(first_index + size, len(text))
+
+    snippet = text[start:end].strip()
+
+    if start > 0:
+        snippet = "..." + snippet
+
+    if end < len(text):
+        snippet = snippet + "..."
+
+    return snippet
+
+
 def find_matching_meetings(
     session: Session,
     query: str,
@@ -318,13 +478,28 @@ def find_matching_meetings(
     expanded_terms = expand_search_terms(query)
 
     meetings = session.exec(select(Meeting)).all()
+
     matched_meetings = []
+    seen_transcript_hashes = set()
 
     for meeting in meetings:
         if meeting.id is None:
             continue
 
-        details = get_meeting_details(session, meeting.id)
+        transcript_hash = get_transcript_hash(meeting.transcript)
+
+        if transcript_hash in seen_transcript_hashes:
+            continue
+
+        seen_transcript_hashes.add(transcript_hash)
+
+        details = get_meeting_details(
+            session=session,
+            meeting_id=meeting.id,
+            include_chunks=False,
+            include_transcript=False,
+        )
+
         searchable_text = json.dumps(details).lower()
 
         matched_terms = [
@@ -332,14 +507,34 @@ def find_matching_meetings(
             if term in searchable_text
         ]
 
-        if matched_terms:
-            matched_meetings.append(
-                {
-                    "score": len(matched_terms),
-                    "matched_terms": matched_terms,
-                    "meeting": details,
-                }
-            )
+        if not matched_terms:
+            continue
+
+        snippet_source = " ".join(
+            [
+                details.get("summary") or "",
+                " ".join(decision["text"] for decision in details.get("decisions", [])),
+                " ".join(risk["text"] for risk in details.get("risks", [])),
+                " ".join(item["task"] for item in details.get("action_items", [])),
+            ]
+        )
+
+        matched_meetings.append(
+            {
+                "score": len(matched_terms),
+                "matched_terms": matched_terms,
+                "meeting_id": details["id"],
+                "title": details["title"],
+                "summary": details["summary"],
+                "snippet": make_snippet(
+                    text=snippet_source,
+                    matched_terms=matched_terms,
+                ),
+                "action_items": details["action_items"],
+                "decisions": details["decisions"],
+                "risks": details["risks"],
+            }
+        )
 
     matched_meetings.sort(
         key=lambda item: item["score"],
@@ -349,40 +544,151 @@ def find_matching_meetings(
     return matched_meetings
 
 
+# -------------------------------------------------------------------
+# Routes
+# -------------------------------------------------------------------
+
+@router.get("/action-items/pending/all")
+def get_pending_action_items(
+    session: Session = Depends(get_session),
+):
+    try:
+        action_items = session.exec(
+            select(ActionItem).where(ActionItem.completed == False)
+        ).all()
+
+        return {
+            "success": True,
+            "count": len(action_items),
+            "data": [
+                {
+                    "id": item.id,
+                    "meeting_id": item.meeting_id,
+                    "owner": item.owner,
+                    "task": item.task,
+                    "completed": item.completed,
+                }
+                for item in action_items
+            ],
+        }
+
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to retrieve pending action items: {str(e)}",
+        )
+
+
+@router.patch("/action-items/{action_item_id}")
+def update_action_item_status(
+    action_item_id: int,
+    request: UpdateActionItemRequest,
+    session: Session = Depends(get_session),
+):
+    try:
+        action_item = session.get(ActionItem, action_item_id)
+
+        if not action_item:
+            raise HTTPException(
+                status_code=404,
+                detail="Action item not found.",
+            )
+
+        action_item.completed = request.completed
+
+        session.add(action_item)
+        session.commit()
+        session.refresh(action_item)
+
+        return {
+            "success": True,
+            "message": "Action item updated successfully.",
+            "data": {
+                "id": action_item.id,
+                "meeting_id": action_item.meeting_id,
+                "owner": action_item.owner,
+                "task": action_item.task,
+                "completed": action_item.completed,
+            },
+        }
+
+    except HTTPException:
+        raise
+
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to update action item: {str(e)}",
+        )
+
+
 @router.post("/analyze")
 async def analyze(
     request: AnalyzeRequest,
     session: Session = Depends(get_session),
 ):
     try:
-        if not request.transcript or not request.transcript.strip():
-            raise HTTPException(status_code=400, detail="Transcript text is required.")
+        transcript = request.transcript.strip()
 
-        analysis = analyze_transcript(request.transcript)
+        if not transcript:
+            raise HTTPException(
+                status_code=400,
+                detail="Transcript text is required.",
+            )
+
+        existing_meeting = find_duplicate_meeting(
+            session=session,
+            transcript=transcript,
+        )
+
+        if existing_meeting:
+            return {
+                "success": True,
+                "message": "Duplicate transcript found. Existing meeting returned.",
+                "data": get_meeting_details(
+                    session=session,
+                    meeting_id=existing_meeting.id,
+                    include_chunks=False,
+                    include_transcript=True,
+                ),
+            }
+
+        analysis = analyze_transcript(transcript)
 
         title = request.title or analysis.get("title") or "Untitled Meeting"
 
         meeting = save_analysis_to_db(
             session=session,
             title=title,
-            transcript=request.transcript,
+            transcript=transcript,
             analysis=analysis,
         )
 
         return {
             "success": True,
             "message": "Meeting analyzed successfully.",
-            "data": get_meeting_details(session, meeting.id),
+            "data": get_meeting_details(
+                session=session,
+                meeting_id=meeting.id,
+                include_chunks=False,
+                include_transcript=True,
+            ),
         }
 
     except HTTPException:
         raise
 
     except ValueError as e:
-        raise HTTPException(status_code=502, detail=f"LLM response error: {str(e)}")
+        raise HTTPException(
+            status_code=502,
+            detail=f"LLM response error: {str(e)}",
+        )
 
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Meeting analysis failed: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Meeting analysis failed: {str(e)}",
+        )
 
 
 @router.post("/upload")
@@ -392,7 +698,10 @@ async def upload_meeting_file(
 ):
     try:
         if not file.filename:
-            raise HTTPException(status_code=400, detail="Uploaded file must have a filename.")
+            raise HTTPException(
+                status_code=400,
+                detail="Uploaded file must have a filename.",
+            )
 
         filename = file.filename.lower()
 
@@ -414,6 +723,26 @@ async def upload_meeting_file(
                 detail="Uploaded file did not contain readable text.",
             )
 
+        transcript_text = transcript_text.strip()
+
+        existing_meeting = find_duplicate_meeting(
+            session=session,
+            transcript=transcript_text,
+        )
+
+        if existing_meeting:
+            return {
+                "success": True,
+                "message": "Duplicate transcript found. Existing meeting returned.",
+                "filename": file.filename,
+                "data": get_meeting_details(
+                    session=session,
+                    meeting_id=existing_meeting.id,
+                    include_chunks=False,
+                    include_transcript=True,
+                ),
+            }
+
         analysis = analyze_transcript(transcript_text)
 
         title = analysis.get("title") or file.filename
@@ -429,34 +758,73 @@ async def upload_meeting_file(
             "success": True,
             "message": "File uploaded and analyzed successfully.",
             "filename": file.filename,
-            "data": get_meeting_details(session, meeting.id),
+            "data": get_meeting_details(
+                session=session,
+                meeting_id=meeting.id,
+                include_chunks=False,
+                include_transcript=True,
+            ),
         }
 
     except HTTPException:
         raise
 
     except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        raise HTTPException(
+            status_code=400,
+            detail=str(e),
+        )
 
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Upload analysis failed: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Upload analysis failed: {str(e)}",
+        )
 
 
 @router.get("")
-def list_meetings(session: Session = Depends(get_session)):
-    meetings = session.exec(
-        select(Meeting).order_by(Meeting.id.desc())
-    ).all()
+def list_meetings(
+    session: Session = Depends(get_session),
+):
+    try:
+        meetings = session.exec(
+            select(Meeting).order_by(Meeting.id.desc())
+        ).all()
 
-    return {
-        "success": True,
-        "count": len(meetings),
-        "data": [
-            get_meeting_details(session, meeting.id)
-            for meeting in meetings
-            if meeting.id is not None
-        ],
-    }
+        seen_hashes = set()
+        data = []
+
+        for meeting in meetings:
+            if meeting.id is None:
+                continue
+
+            transcript_hash = get_transcript_hash(meeting.transcript)
+
+            if transcript_hash in seen_hashes:
+                continue
+
+            seen_hashes.add(transcript_hash)
+
+            data.append(
+                get_meeting_details(
+                    session=session,
+                    meeting_id=meeting.id,
+                    include_chunks=False,
+                    include_transcript=False,
+                )
+            )
+
+        return {
+            "success": True,
+            "count": len(data),
+            "data": data,
+        }
+
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to retrieve meetings: {str(e)}",
+        )
 
 
 @router.post("/ask")
@@ -466,13 +834,19 @@ async def ask_meeting_question(
 ):
     try:
         if not request.question or not request.question.strip():
-            raise HTTPException(status_code=400, detail="Question is required.")
+            raise HTTPException(
+                status_code=400,
+                detail="Question is required.",
+            )
 
         if request.meeting_id:
             meeting = session.get(Meeting, request.meeting_id)
 
             if not meeting:
-                raise HTTPException(status_code=404, detail="Meeting not found.")
+                raise HTTPException(
+                    status_code=404,
+                    detail="Meeting not found.",
+                )
 
             meetings = [meeting]
 
@@ -482,9 +856,15 @@ async def ask_meeting_question(
             ).all()
 
             if not meetings:
-                raise HTTPException(status_code=404, detail="No analyzed meetings found.")
+                raise HTTPException(
+                    status_code=404,
+                    detail="No analyzed meetings found.",
+                )
 
-        context_text = build_meeting_context(session=session, meetings=meetings)
+        context_text = build_meeting_context(
+            session=session,
+            meetings=meetings,
+        )
 
         answer = answer_meeting_question(
             question=request.question,
@@ -501,10 +881,16 @@ async def ask_meeting_question(
         raise
 
     except ValueError as e:
-        raise HTTPException(status_code=502, detail=f"LLM response error: {str(e)}")
+        raise HTTPException(
+            status_code=502,
+            detail=f"LLM response error: {str(e)}",
+        )
 
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Question answering failed: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Question answering failed: {str(e)}",
+        )
 
 
 @router.post("/search")
@@ -514,7 +900,10 @@ def search_meetings(
 ):
     try:
         if not request.query or not request.query.strip():
-            raise HTTPException(status_code=400, detail="Search query is required.")
+            raise HTTPException(
+                status_code=400,
+                detail="Search query is required.",
+            )
 
         matched_meetings = find_matching_meetings(
             session=session,
@@ -537,7 +926,7 @@ def search_meetings(
         matched_meeting_objects = []
 
         for item in matched_meetings:
-            meeting_id = item["meeting"]["id"]
+            meeting_id = item["meeting_id"]
             meeting = session.get(Meeting, meeting_id)
 
             if meeting:
@@ -565,10 +954,16 @@ def search_meetings(
         raise
 
     except ValueError as e:
-        raise HTTPException(status_code=502, detail=f"LLM response error: {str(e)}")
+        raise HTTPException(
+            status_code=502,
+            detail=f"LLM response error: {str(e)}",
+        )
 
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Meeting search failed: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Meeting search failed: {str(e)}",
+        )
 
 
 @router.post("/followup-email")
@@ -580,9 +975,17 @@ async def create_followup_email(
         meeting = session.get(Meeting, request.meeting_id)
 
         if not meeting:
-            raise HTTPException(status_code=404, detail="Meeting not found.")
+            raise HTTPException(
+                status_code=404,
+                detail="Meeting not found.",
+            )
 
-        analysis = get_meeting_details(session, meeting.id)
+        analysis = get_meeting_details(
+            session=session,
+            meeting_id=meeting.id,
+            include_chunks=False,
+            include_transcript=False,
+        )
 
         email = generate_followup_email(
             transcript=meeting.transcript,
@@ -599,7 +1002,10 @@ async def create_followup_email(
         raise
 
     except ValueError as e:
-        raise HTTPException(status_code=502, detail=f"LLM response error: {str(e)}")
+        raise HTTPException(
+            status_code=502,
+            detail=f"LLM response error: {str(e)}",
+        )
 
     except Exception as e:
         raise HTTPException(
@@ -615,7 +1021,10 @@ async def get_multi_meeting_insights(
 ):
     try:
         if not request.query or not request.query.strip():
-            raise HTTPException(status_code=400, detail="Insight query is required.")
+            raise HTTPException(
+                status_code=400,
+                detail="Insight query is required.",
+            )
 
         if request.meeting_ids:
             meetings = session.exec(
@@ -627,11 +1036,26 @@ async def get_multi_meeting_insights(
             ).all()
 
         if not meetings:
-            raise HTTPException(status_code=404, detail="No meetings found.")
+            raise HTTPException(
+                status_code=404,
+                detail="No meetings found for insight generation.",
+            )
+
+        unique_meetings = []
+        seen_hashes = set()
+
+        for meeting in meetings:
+            transcript_hash = get_transcript_hash(meeting.transcript)
+
+            if transcript_hash in seen_hashes:
+                continue
+
+            seen_hashes.add(transcript_hash)
+            unique_meetings.append(meeting)
 
         meetings_context = build_meeting_context(
             session=session,
-            meetings=meetings,
+            meetings=unique_meetings,
         )
 
         insights = consolidate_meeting_insights(
@@ -642,7 +1066,11 @@ async def get_multi_meeting_insights(
         return {
             "success": True,
             "message": "Multi-meeting insights generated successfully.",
-            "meeting_count": len(meetings),
+            "meeting_count": len(unique_meetings),
+            "meeting_titles": [
+                meeting.title or f"Meeting {meeting.id}"
+                for meeting in unique_meetings
+            ],
             "data": insights,
         }
 
@@ -650,65 +1078,16 @@ async def get_multi_meeting_insights(
         raise
 
     except ValueError as e:
-        raise HTTPException(status_code=502, detail=f"LLM response error: {str(e)}")
+        raise HTTPException(
+            status_code=502,
+            detail=f"LLM response error: {str(e)}",
+        )
 
     except Exception as e:
         raise HTTPException(
             status_code=500,
             detail=f"Multi-meeting insight generation failed: {str(e)}",
         )
-
-
-@router.get("/action-items/pending/all")
-def get_pending_action_items(session: Session = Depends(get_session)):
-    action_items = session.exec(
-        select(ActionItem).where(ActionItem.completed == False)
-    ).all()
-
-    return {
-        "success": True,
-        "count": len(action_items),
-        "data": [
-            {
-                "id": item.id,
-                "meeting_id": item.meeting_id,
-                "owner": item.owner,
-                "task": item.task,
-                "completed": item.completed,
-            }
-            for item in action_items
-        ],
-    }
-
-
-@router.patch("/action-items/{action_item_id}")
-def update_action_item_status(
-    action_item_id: int,
-    request: UpdateActionItemRequest,
-    session: Session = Depends(get_session),
-):
-    action_item = session.get(ActionItem, action_item_id)
-
-    if not action_item:
-        raise HTTPException(status_code=404, detail="Action item not found.")
-
-    action_item.completed = request.completed
-
-    session.add(action_item)
-    session.commit()
-    session.refresh(action_item)
-
-    return {
-        "success": True,
-        "message": "Action item updated successfully.",
-        "data": {
-            "id": action_item.id,
-            "meeting_id": action_item.meeting_id,
-            "owner": action_item.owner,
-            "task": action_item.task,
-            "completed": action_item.completed,
-        },
-    }
 
 
 @router.get("/{meeting_id}")
@@ -718,7 +1097,12 @@ def get_meeting(
 ):
     return {
         "success": True,
-        "data": get_meeting_details(session, meeting_id),
+        "data": get_meeting_details(
+            session=session,
+            meeting_id=meeting_id,
+            include_chunks=True,
+            include_transcript=True,
+        ),
     }
 
 
@@ -727,43 +1111,56 @@ def delete_meeting(
     meeting_id: int,
     session: Session = Depends(get_session),
 ):
-    meeting = session.get(Meeting, meeting_id)
+    try:
+        meeting = session.get(Meeting, meeting_id)
 
-    if not meeting:
-        raise HTTPException(status_code=404, detail="Meeting not found.")
+        if not meeting:
+            raise HTTPException(
+                status_code=404,
+                detail="Meeting not found.",
+            )
 
-    action_items = session.exec(
-        select(ActionItem).where(ActionItem.meeting_id == meeting_id)
-    ).all()
+        action_items = session.exec(
+            select(ActionItem).where(ActionItem.meeting_id == meeting_id)
+        ).all()
 
-    decisions = session.exec(
-        select(Decision).where(Decision.meeting_id == meeting_id)
-    ).all()
+        decisions = session.exec(
+            select(Decision).where(Decision.meeting_id == meeting_id)
+        ).all()
 
-    risks = session.exec(
-        select(Risk).where(Risk.meeting_id == meeting_id)
-    ).all()
+        risks = session.exec(
+            select(Risk).where(Risk.meeting_id == meeting_id)
+        ).all()
 
-    chunks = session.exec(
-        select(TranscriptChunk).where(TranscriptChunk.meeting_id == meeting_id)
-    ).all()
+        chunks = session.exec(
+            select(TranscriptChunk).where(TranscriptChunk.meeting_id == meeting_id)
+        ).all()
 
-    for item in action_items:
-        session.delete(item)
+        for item in action_items:
+            session.delete(item)
 
-    for decision in decisions:
-        session.delete(decision)
+        for decision in decisions:
+            session.delete(decision)
 
-    for risk in risks:
-        session.delete(risk)
+        for risk in risks:
+            session.delete(risk)
 
-    for chunk in chunks:
-        session.delete(chunk)
+        for chunk in chunks:
+            session.delete(chunk)
 
-    session.delete(meeting)
-    session.commit()
+        session.delete(meeting)
+        session.commit()
 
-    return {
-        "success": True,
-        "message": "Meeting deleted successfully.",
-    }
+        return {
+            "success": True,
+            "message": "Meeting deleted successfully.",
+        }
+
+    except HTTPException:
+        raise
+
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to delete meeting: {str(e)}",
+        )
