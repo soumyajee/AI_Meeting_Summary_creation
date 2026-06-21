@@ -1,1166 +1,312 @@
-import hashlib
 import json
-from typing import Any, Dict, List, Optional
+import os
+import re
+from typing import Any, Dict, Optional
 
-from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
-from sqlmodel import Session, select
+from dotenv import load_dotenv
+from groq import Groq
 
-from .db import get_session
-from .llm import (
-    analyze_transcript,
-    answer_meeting_question,
-    consolidate_meeting_insights,
-    generate_followup_email,
-)
-from .models import ActionItem, Decision, Meeting, Risk, TranscriptChunk
-from .schemas import (
-    AnalyzeRequest,
-    FollowupRequest,
-    MultiMeetingInsightRequest,
-    QARequest,
-    SearchRequest,
-    UpdateActionItemRequest,
-)
-from .utils import chunk_transcript, read_upload_file
+load_dotenv()
+
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
 
 
-router = APIRouter(
-    prefix="/meetings",
-    tags=["Meetings"],
-)
+def extract_json(raw_text: str) -> Dict[str, Any]:
+    if not raw_text or not raw_text.strip():
+        raise ValueError("LLM returned an empty response.")
+
+    text = raw_text.strip()
+    text = text.replace("```json", "").replace("```", "").strip()
+
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+
+    match = re.search(r"\{.*\}", text, re.DOTALL)
+
+    if not match:
+        raise ValueError(f"LLM did not return valid JSON. Raw response: {raw_text}")
+
+    try:
+        return json.loads(match.group(0))
+    except json.JSONDecodeError as e:
+        raise ValueError(f"Failed to parse LLM JSON. Raw response: {raw_text}") from e
 
 
-# -------------------------------------------------------------------
-# Text / Duplicate Helpers
-# -------------------------------------------------------------------
+def chat_json(system_prompt: str, user_prompt: str) -> Dict[str, Any]:
+    if not GROQ_API_KEY:
+        raise ValueError("GROQ_API_KEY is missing in .env file.")
 
-def normalize_transcript_for_hash(transcript: str) -> str:
-    return " ".join((transcript or "").lower().split())
+    try:
+        client = Groq(api_key=GROQ_API_KEY)
 
-
-def get_transcript_hash(transcript: str) -> str:
-    normalized = normalize_transcript_for_hash(transcript)
-    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
-
-
-def is_same_transcript(existing_transcript: str, new_transcript: str) -> bool:
-    return get_transcript_hash(existing_transcript) == get_transcript_hash(new_transcript)
-
-
-def find_duplicate_meeting(
-    session: Session,
-    transcript: str,
-) -> Optional[Meeting]:
-    meetings = session.exec(select(Meeting)).all()
-
-    for meeting in meetings:
-        if is_same_transcript(meeting.transcript, transcript):
-            return meeting
-
-    return None
-
-
-def normalize_text(value: Any) -> str:
-    if value is None:
-        return ""
-
-    if isinstance(value, dict):
-        return (
-            value.get("text")
-            or value.get("decision")
-            or value.get("risk")
-            or value.get("concern")
-            or value.get("task")
-            or json.dumps(value)
-        ).strip()
-
-    return str(value).strip()
-
-
-def normalize_action_item(item: Any) -> Dict[str, Any]:
-    if isinstance(item, dict):
-        return {
-            "owner": item.get("owner") or "Unassigned",
-            "task": item.get("task") or item.get("text") or "",
-            "completed": bool(item.get("completed", False)),
-        }
-
-    return {
-        "owner": "Unassigned",
-        "task": str(item),
-        "completed": False,
-    }
-
-
-# -------------------------------------------------------------------
-# Database Save / Retrieve Helpers
-# -------------------------------------------------------------------
-
-def save_transcript_chunks(
-    session: Session,
-    meeting_id: int,
-    transcript: str,
-) -> None:
-    chunks = chunk_transcript(transcript)
-
-    start_pos = 0
-
-    for chunk_text in chunks:
-        session.add(
-            TranscriptChunk(
-                meeting_id=meeting_id,
-                text=chunk_text,
-                start_pos=start_pos,
-            )
+        response = client.chat.completions.create(
+            model=GROQ_MODEL,
+            temperature=0.1,
+            response_format={"type": "json_object"},
+            messages=[
+                {
+                    "role": "system",
+                    "content": system_prompt,
+                },
+                {
+                    "role": "user",
+                    "content": user_prompt,
+                },
+            ],
         )
 
-        start_pos += len(chunk_text)
+        raw_content = response.choices[0].message.content
+
+        print("----- RAW GROQ RESPONSE START -----")
+        print(raw_content)
+        print("----- RAW GROQ RESPONSE END -----")
+
+        return extract_json(raw_content)
+
+    except ValueError:
+        raise
+
+    except Exception as e:
+        raise ValueError(f"Groq LLM call failed: {str(e)}") from e
 
 
-def save_analysis_to_db(
-    session: Session,
-    title: str,
-    transcript: str,
-    analysis: Dict[str, Any],
-) -> Meeting:
-    duplicate_meeting = find_duplicate_meeting(
-        session=session,
-        transcript=transcript,
-    )
+def analyze_transcript(transcript: str) -> Dict[str, Any]:
+    if not transcript or not transcript.strip():
+        raise ValueError("Transcript is empty.")
 
-    if duplicate_meeting:
-        return duplicate_meeting
+    system_prompt = """
+You are an AI Meeting Assistant.
 
-    meeting = Meeting(
-        title=title,
-        transcript=transcript,
-        summary=analysis.get("summary", ""),
-    )
+Return ONLY valid JSON.
+Do not include markdown.
+Do not include explanation text.
+Always return every key from the required JSON structure.
+"""
 
-    session.add(meeting)
-    session.commit()
-    session.refresh(meeting)
+    user_prompt = f"""
+Analyze the meeting transcript.
 
-    if meeting.id is None:
-        raise RuntimeError("Meeting ID was not created.")
+Return JSON in this exact structure:
 
-    meeting_id = meeting.id
+{{
+  "title": "",
+  "summary": "",
+  "action_items": [
+    {{
+      "owner": "",
+      "task": "",
+      "deadline": "",
+      "status": "pending"
+    }}
+  ],
+  "decisions": [],
+  "risks": [],
+  "concerns": []
+}}
 
-    seen_action_items = set()
-
-    for raw_item in analysis.get("action_items", []):
-        item = normalize_action_item(raw_item)
-
-        owner = (item["owner"] or "Unassigned").strip()
-        task = (item["task"] or "").strip()
-
-        if not task:
-            continue
-
-        action_key = (owner.lower(), task.lower())
-
-        if action_key in seen_action_items:
-            continue
-
-        seen_action_items.add(action_key)
-
-        session.add(
-            ActionItem(
-                meeting_id=meeting_id,
-                owner=owner,
-                task=task,
-                completed=bool(item["completed"]),
-            )
-        )
-
-    seen_decisions = set()
-
-    for raw_decision in analysis.get("decisions", []):
-        decision_text = normalize_text(raw_decision)
-
-        if not decision_text:
-            continue
-
-        decision_key = decision_text.lower()
-
-        if decision_key in seen_decisions:
-            continue
-
-        seen_decisions.add(decision_key)
-
-        session.add(
-            Decision(
-                meeting_id=meeting_id,
-                text=decision_text,
-            )
-        )
-
-    risk_values = []
-
-    if isinstance(analysis.get("risks"), list):
-        risk_values.extend(analysis.get("risks", []))
-
-    if isinstance(analysis.get("concerns"), list):
-        risk_values.extend(analysis.get("concerns", []))
-
-    seen_risks = set()
-
-    for raw_risk in risk_values:
-        risk_text = normalize_text(raw_risk)
-
-        if not risk_text:
-            continue
-
-        risk_key = risk_text.lower()
-
-        if risk_key in seen_risks:
-            continue
-
-        seen_risks.add(risk_key)
-
-        session.add(
-            Risk(
-                meeting_id=meeting_id,
-                text=risk_text,
-            )
-        )
-
-    save_transcript_chunks(
-        session=session,
-        meeting_id=meeting_id,
-        transcript=transcript,
-    )
-
-    session.commit()
-    session.refresh(meeting)
-
-    return meeting
-
-
-def get_meeting_details(
-    session: Session,
-    meeting_id: int,
-    include_chunks: bool = False,
-    include_transcript: bool = True,
-) -> Dict[str, Any]:
-    meeting = session.get(Meeting, meeting_id)
-
-    if not meeting:
-        raise HTTPException(
-            status_code=404,
-            detail="Meeting not found.",
-        )
-
-    action_items = session.exec(
-        select(ActionItem).where(ActionItem.meeting_id == meeting_id)
-    ).all()
-
-    decisions = session.exec(
-        select(Decision).where(Decision.meeting_id == meeting_id)
-    ).all()
-
-    risks = session.exec(
-        select(Risk).where(Risk.meeting_id == meeting_id)
-    ).all()
-
-    data = {
-        "id": meeting.id,
-        "title": meeting.title,
-        "summary": meeting.summary,
-        "action_items": [
-            {
-                "id": item.id,
-                "owner": item.owner,
-                "task": item.task,
-                "completed": item.completed,
-            }
-            for item in action_items
-        ],
-        "decisions": [
-            {
-                "id": decision.id,
-                "text": decision.text,
-            }
-            for decision in decisions
-        ],
-        "risks": [
-            {
-                "id": risk.id,
-                "text": risk.text,
-            }
-            for risk in risks
-        ],
-    }
-
-    if include_transcript:
-        data["transcript"] = meeting.transcript
-
-    if include_chunks:
-        chunks = session.exec(
-            select(TranscriptChunk).where(TranscriptChunk.meeting_id == meeting_id)
-        ).all()
-
-        data["chunks"] = [
-            {
-                "id": chunk.id,
-                "text": chunk.text,
-                "start_pos": chunk.start_pos,
-            }
-            for chunk in chunks
-        ]
-
-    return data
-
-
-def build_meeting_context(
-    session: Session,
-    meetings: List[Meeting],
-) -> str:
-    context_parts = []
-
-    seen_hashes = set()
-
-    for meeting in meetings:
-        if meeting.id is None:
-            continue
-
-        transcript_hash = get_transcript_hash(meeting.transcript)
-
-        if transcript_hash in seen_hashes:
-            continue
-
-        seen_hashes.add(transcript_hash)
-
-        details = get_meeting_details(
-            session=session,
-            meeting_id=meeting.id,
-            include_chunks=False,
-            include_transcript=True,
-        )
-
-        context_parts.append(
-            f"""
-Meeting ID: {details["id"]}
-Title: {details["title"]}
+Rules:
+- Extract meeting summary, action items, decisions, and risks/concerns.
+- Extract action items only from clear action/task statements.
+- A sentence should become an action item only if it clearly assigns work to a person.
+- Lines starting with "Action:" are strong action item signals.
+- Direct statements like "Alice will complete testing" can be action items.
+- Do not convert every discussion sentence into an action item.
+- Do not convert general discussion statements like "we need to confirm..." into action items unless a specific owner is clearly responsible.
+- Do not duplicate action items with similar meaning.
+- If owner is not clear, use "Unassigned".
+- If deadline is unavailable, use an empty string.
+- Action item status should be "pending" by default.
+- Extract decisions only from clear decisions or agreed outcomes.
+- Extract risks only from clear risk, concern, blocker, issue, or dependency statements.
+- Do not convert normal dependencies into risks unless explicitly stated as risk, concern, blocker, issue, or dependency.
+- Do not invent information.
+- Return valid JSON only.
 
 Transcript:
-{details["transcript"]}
-
-Summary:
-{details["summary"]}
-
-Action Items:
-{json.dumps(details["action_items"], indent=2)}
-
-Decisions:
-{json.dumps(details["decisions"], indent=2)}
-
-Risks:
-{json.dumps(details["risks"], indent=2)}
+{transcript}
 """
-        )
 
-    return "\n\n---\n\n".join(context_parts)
-
-
-# -------------------------------------------------------------------
-# Search Helpers
-# -------------------------------------------------------------------
-
-def expand_search_terms(query: str) -> List[str]:
-    raw_query = query.lower().strip()
-
-    stop_words = {
-        "what", "who", "when", "where", "why", "how",
-        "were", "was", "is", "are", "be", "been",
-        "the", "a", "an", "during", "meeting", "meetings",
-        "identified", "made", "taken", "show", "find",
-        "all", "about", "regarding", "related", "to",
-        "of", "in", "for", "with", "on",
-    }
-
-    synonym_map = {
-        "deployment": [
-            "deployment", "deploy", "deployed", "staging",
-            "production", "release", "rollout",
-        ],
-        "deploy": [
-            "deployment", "deploy", "deployed", "staging",
-            "production", "release", "rollout",
-        ],
-        "decisions": [
-            "decision", "decisions", "decided", "agreed",
-            "approved", "confirmed",
-        ],
-        "decision": [
-            "decision", "decisions", "decided", "agreed",
-            "approved", "confirmed",
-        ],
-        "risks": [
-            "risk", "risks", "concern", "concerns",
-            "blocker", "issue", "dependency",
-        ],
-        "risk": [
-            "risk", "risks", "concern", "concerns",
-            "blocker", "issue", "dependency",
-        ],
-        "actions": [
-            "action", "actions", "task", "tasks",
-            "owner", "assigned", "pending",
-        ],
-        "action": [
-            "action", "actions", "task", "tasks",
-            "owner", "assigned", "pending",
-        ],
-    }
-
-    words = [
-        word.strip("?.!,;:")
-        for word in raw_query.split()
-        if word.strip("?.!,;:")
-        and word.strip("?.!,;:") not in stop_words
-    ]
-
-    expanded_terms = set()
-
-    for word in words:
-        expanded_terms.add(word)
-
-        if word in synonym_map:
-            expanded_terms.update(synonym_map[word])
-
-    if not expanded_terms:
-        expanded_terms.add(raw_query)
-
-    return sorted(expanded_terms)
+    return chat_json(system_prompt, user_prompt)
 
 
-def make_snippet(
-    text: str,
-    matched_terms: List[str],
-    size: int = 180,
-) -> str:
-    if not text:
-        return ""
+def answer_meeting_question(question: str, context_text: str) -> Dict[str, Any]:
+    if not question or not question.strip():
+        raise ValueError("Question is empty.")
 
-    lower_text = text.lower()
+    if not context_text or not context_text.strip():
+        raise ValueError("Meeting context is empty.")
 
-    first_index = -1
+    system_prompt = """
+You are an AI Meeting Assistant answering questions from stored meeting data.
 
-    for term in matched_terms:
-        index = lower_text.find(term.lower())
+Return ONLY valid JSON.
+Do not include markdown.
+Do not include explanation text.
+Use only the provided meeting context.
+Always return every key from the required JSON structure.
+"""
 
-        if index != -1:
-            first_index = index
-            break
+    user_prompt = f"""
+Answer the user question using only the meeting context.
 
-    if first_index == -1:
-        return text[:size] + ("..." if len(text) > size else "")
+Return JSON in this exact structure:
 
-    start = max(first_index - 60, 0)
-    end = min(first_index + size, len(text))
+{{
+  "question": "",
+  "answer": "",
+  "supporting_points": []
+}}
 
-    snippet = text[start:end].strip()
+Rules:
+- Always include question, answer, and supporting_points.
+- If the question asks about risks, list all risks found in the meeting context.
+- If the question asks about decisions, list all decisions found in the meeting context.
+- If the question asks about action items, include owner and task.
+- If the question asks about pending action items, include only incomplete action items.
+- If the answer is not available, say "No relevant information found in the meeting context."
+- Do not invent information.
+- Keep the answer concise and professional.
 
-    if start > 0:
-        snippet = "..." + snippet
+Question:
+{question}
 
-    if end < len(text):
-        snippet = snippet + "..."
+Meeting Context:
+{context_text}
+"""
 
-    return snippet
+    return chat_json(system_prompt, user_prompt)
 
 
-def find_matching_meetings(
-    session: Session,
+def generate_followup_email(
+    transcript: str,
+    analysis: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    if not transcript or not transcript.strip():
+        raise ValueError("Transcript is empty.")
+
+    system_prompt = """
+You are an AI Meeting Assistant that writes professional follow-up emails.
+
+Return ONLY valid JSON.
+Do not include markdown.
+Do not include explanation text.
+Always return every key from the required JSON structure.
+"""
+
+    user_prompt = f"""
+Generate a professional follow-up email.
+
+Return JSON in this exact structure:
+
+{{
+  "subject": "",
+  "body": ""
+}}
+
+The email should include:
+- greeting
+- short meeting summary
+- action items with owners
+- decisions
+- risks or concerns
+- professional closing
+- Do not use placeholders like [Your Name], [Company Name], [Recipient Name], or [Sender Name].
+- If no sender name is available, close the email with:
+  Best regards,
+  Team
+
+Rules:
+- Use only the provided meeting analysis and transcript.
+- Do not invent names, attendees, dates, or company details.
+- Keep the tone professional and concise.
+- Format the body with clear sections where appropriate.
+- Return valid JSON only.
+
+Meeting Analysis:
+{json.dumps(analysis or {}, indent=2)}
+
+Transcript:
+{transcript}
+"""
+
+    return chat_json(system_prompt, user_prompt)
+
+
+def consolidate_meeting_insights(
+    meetings_context: str,
     query: str,
-) -> List[Dict[str, Any]]:
-    expanded_terms = expand_search_terms(query)
+) -> Dict[str, Any]:
+    if not query or not query.strip():
+        raise ValueError("Query is empty.")
+
+    if not meetings_context or not meetings_context.strip():
+        raise ValueError("Meetings context is empty.")
+
+    system_prompt = """
+You are an AI Meeting Assistant.
+
+You analyze multiple previous meetings and generate consolidated insights.
+
+Return ONLY valid JSON.
+Do not include markdown.
+Do not include explanation text.
+Use only the provided meeting context.
+Always return every key from the required JSON structure.
+"""
+
+    user_prompt = f"""
+Analyze the previous meetings and answer the user query.
+
+Return JSON using EXACTLY this structure. Do not remove any key:
+
+{{
+  "query": "{query}",
+  "summary": "",
+  "previous_discussions": [],
+  "planning_points": [],
+  "important_decisions": [],
+  "pending_action_items": [
+    {{
+      "owner": "",
+      "task": "",
+      "meeting_reference": ""
+    }}
+  ],
+  "completed_action_items": [
+    {{
+      "owner": "",
+      "task": "",
+      "meeting_reference": ""
+    }}
+  ],
+  "recurring_risks": [],
+  "final_next_steps": [],
+  "key_themes": []
+}}
+
+Rules:
+- Use only the provided meeting context.
+- Do not invent information.
+- Always include all keys from the JSON structure.
+- If the query asks about risks, fill recurring_risks and focus summary on risks.
+- If the query asks about action items, fill pending_action_items and completed_action_items.
+- If the query asks about decisions, fill important_decisions.
+- If the query asks about deployment, include planning_points, important_decisions, recurring_risks, and final_next_steps.
+- Include only incomplete action items in pending_action_items.
+- Include completed action items only in completed_action_items.
+- If information is unavailable, return an empty list.
+- meeting_reference must be the meeting title when available.
+- Do not duplicate repeated action items, decisions, or risks.
+
+Query:
+{query}
+
+Previous Meetings Context:
+{meetings_context}
+"""
+
+    return chat_json(system_prompt, user_prompt)
 
-    meetings = session.exec(select(Meeting)).all()
-
-    matched_meetings = []
-    seen_transcript_hashes = set()
-
-    for meeting in meetings:
-        if meeting.id is None:
-            continue
-
-        transcript_hash = get_transcript_hash(meeting.transcript)
-
-        if transcript_hash in seen_transcript_hashes:
-            continue
-
-        seen_transcript_hashes.add(transcript_hash)
-
-        details = get_meeting_details(
-            session=session,
-            meeting_id=meeting.id,
-            include_chunks=False,
-            include_transcript=False,
-        )
-
-        searchable_text = json.dumps(details).lower()
-
-        matched_terms = [
-            term for term in expanded_terms
-            if term in searchable_text
-        ]
-
-        if not matched_terms:
-            continue
-
-        snippet_source = " ".join(
-            [
-                details.get("summary") or "",
-                " ".join(decision["text"] for decision in details.get("decisions", [])),
-                " ".join(risk["text"] for risk in details.get("risks", [])),
-                " ".join(item["task"] for item in details.get("action_items", [])),
-            ]
-        )
-
-        matched_meetings.append(
-            {
-                "score": len(matched_terms),
-                "matched_terms": matched_terms,
-                "meeting_id": details["id"],
-                "title": details["title"],
-                "summary": details["summary"],
-                "snippet": make_snippet(
-                    text=snippet_source,
-                    matched_terms=matched_terms,
-                ),
-                "action_items": details["action_items"],
-                "decisions": details["decisions"],
-                "risks": details["risks"],
-            }
-        )
-
-    matched_meetings.sort(
-        key=lambda item: item["score"],
-        reverse=True,
-    )
-
-    return matched_meetings
-
-
-# -------------------------------------------------------------------
-# Routes
-# -------------------------------------------------------------------
-
-@router.get("/action-items/pending/all")
-def get_pending_action_items(
-    session: Session = Depends(get_session),
-):
-    try:
-        action_items = session.exec(
-            select(ActionItem).where(ActionItem.completed == False)
-        ).all()
-
-        return {
-            "success": True,
-            "count": len(action_items),
-            "data": [
-                {
-                    "id": item.id,
-                    "meeting_id": item.meeting_id,
-                    "owner": item.owner,
-                    "task": item.task,
-                    "completed": item.completed,
-                }
-                for item in action_items
-            ],
-        }
-
-    except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Failed to retrieve pending action items: {str(e)}",
-        )
-
-
-@router.patch("/action-items/{action_item_id}")
-def update_action_item_status(
-    action_item_id: int,
-    request: UpdateActionItemRequest,
-    session: Session = Depends(get_session),
-):
-    try:
-        action_item = session.get(ActionItem, action_item_id)
-
-        if not action_item:
-            raise HTTPException(
-                status_code=404,
-                detail="Action item not found.",
-            )
-
-        action_item.completed = request.completed
-
-        session.add(action_item)
-        session.commit()
-        session.refresh(action_item)
-
-        return {
-            "success": True,
-            "message": "Action item updated successfully.",
-            "data": {
-                "id": action_item.id,
-                "meeting_id": action_item.meeting_id,
-                "owner": action_item.owner,
-                "task": action_item.task,
-                "completed": action_item.completed,
-            },
-        }
-
-    except HTTPException:
-        raise
-
-    except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Failed to update action item: {str(e)}",
-        )
-
-
-@router.post("/analyze")
-async def analyze(
-    request: AnalyzeRequest,
-    session: Session = Depends(get_session),
-):
-    try:
-        transcript = request.transcript.strip()
-
-        if not transcript:
-            raise HTTPException(
-                status_code=400,
-                detail="Transcript text is required.",
-            )
-
-        existing_meeting = find_duplicate_meeting(
-            session=session,
-            transcript=transcript,
-        )
-
-        if existing_meeting:
-            return {
-                "success": True,
-                "message": "Duplicate transcript found. Existing meeting returned.",
-                "data": get_meeting_details(
-                    session=session,
-                    meeting_id=existing_meeting.id,
-                    include_chunks=False,
-                    include_transcript=True,
-                ),
-            }
-
-        analysis = analyze_transcript(transcript)
-
-        title = request.title or analysis.get("title") or "Untitled Meeting"
-
-        meeting = save_analysis_to_db(
-            session=session,
-            title=title,
-            transcript=transcript,
-            analysis=analysis,
-        )
-
-        return {
-            "success": True,
-            "message": "Meeting analyzed successfully.",
-            "data": get_meeting_details(
-                session=session,
-                meeting_id=meeting.id,
-                include_chunks=False,
-                include_transcript=True,
-            ),
-        }
-
-    except HTTPException:
-        raise
-
-    except ValueError as e:
-        raise HTTPException(
-            status_code=502,
-            detail=f"LLM response error: {str(e)}",
-        )
-
-    except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Meeting analysis failed: {str(e)}",
-        )
-
-
-@router.post("/upload")
-async def upload_meeting_file(
-    file: UploadFile = File(...),
-    session: Session = Depends(get_session),
-):
-    try:
-        if not file.filename:
-            raise HTTPException(
-                status_code=400,
-                detail="Uploaded file must have a filename.",
-            )
-
-        filename = file.filename.lower()
-
-        if not (
-            filename.endswith(".txt")
-            or filename.endswith(".pdf")
-            or filename.endswith(".docx")
-        ):
-            raise HTTPException(
-                status_code=400,
-                detail="Only .txt, .pdf, and .docx files are supported.",
-            )
-
-        transcript_text = read_upload_file(file)
-
-        if not transcript_text or not transcript_text.strip():
-            raise HTTPException(
-                status_code=400,
-                detail="Uploaded file did not contain readable text.",
-            )
-
-        transcript_text = transcript_text.strip()
-
-        existing_meeting = find_duplicate_meeting(
-            session=session,
-            transcript=transcript_text,
-        )
-
-        if existing_meeting:
-            return {
-                "success": True,
-                "message": "Duplicate transcript found. Existing meeting returned.",
-                "filename": file.filename,
-                "data": get_meeting_details(
-                    session=session,
-                    meeting_id=existing_meeting.id,
-                    include_chunks=False,
-                    include_transcript=True,
-                ),
-            }
-
-        analysis = analyze_transcript(transcript_text)
-
-        title = analysis.get("title") or file.filename
-
-        meeting = save_analysis_to_db(
-            session=session,
-            title=title,
-            transcript=transcript_text,
-            analysis=analysis,
-        )
-
-        return {
-            "success": True,
-            "message": "File uploaded and analyzed successfully.",
-            "filename": file.filename,
-            "data": get_meeting_details(
-                session=session,
-                meeting_id=meeting.id,
-                include_chunks=False,
-                include_transcript=True,
-            ),
-        }
-
-    except HTTPException:
-        raise
-
-    except ValueError as e:
-        raise HTTPException(
-            status_code=400,
-            detail=str(e),
-        )
-
-    except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Upload analysis failed: {str(e)}",
-        )
-
-
-@router.get("")
-def list_meetings(
-    session: Session = Depends(get_session),
-):
-    try:
-        meetings = session.exec(
-            select(Meeting).order_by(Meeting.id.desc())
-        ).all()
-
-        seen_hashes = set()
-        data = []
-
-        for meeting in meetings:
-            if meeting.id is None:
-                continue
-
-            transcript_hash = get_transcript_hash(meeting.transcript)
-
-            if transcript_hash in seen_hashes:
-                continue
-
-            seen_hashes.add(transcript_hash)
-
-            data.append(
-                get_meeting_details(
-                    session=session,
-                    meeting_id=meeting.id,
-                    include_chunks=False,
-                    include_transcript=False,
-                )
-            )
-
-        return {
-            "success": True,
-            "count": len(data),
-            "data": data,
-        }
-
-    except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Failed to retrieve meetings: {str(e)}",
-        )
-
-
-@router.post("/ask")
-async def ask_meeting_question(
-    request: QARequest,
-    session: Session = Depends(get_session),
-):
-    try:
-        if not request.question or not request.question.strip():
-            raise HTTPException(
-                status_code=400,
-                detail="Question is required.",
-            )
-
-        if request.meeting_id:
-            meeting = session.get(Meeting, request.meeting_id)
-
-            if not meeting:
-                raise HTTPException(
-                    status_code=404,
-                    detail="Meeting not found.",
-                )
-
-            meetings = [meeting]
-
-        else:
-            meetings = session.exec(
-                select(Meeting).order_by(Meeting.id.desc())
-            ).all()
-
-            if not meetings:
-                raise HTTPException(
-                    status_code=404,
-                    detail="No analyzed meetings found.",
-                )
-
-        context_text = build_meeting_context(
-            session=session,
-            meetings=meetings,
-        )
-
-        answer = answer_meeting_question(
-            question=request.question,
-            context_text=context_text,
-        )
-
-        return {
-            "success": True,
-            "message": "Question answered successfully.",
-            "data": answer,
-        }
-
-    except HTTPException:
-        raise
-
-    except ValueError as e:
-        raise HTTPException(
-            status_code=502,
-            detail=f"LLM response error: {str(e)}",
-        )
-
-    except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Question answering failed: {str(e)}",
-        )
-
-
-@router.post("/search")
-def search_meetings(
-    request: SearchRequest,
-    session: Session = Depends(get_session),
-):
-    try:
-        if not request.query or not request.query.strip():
-            raise HTTPException(
-                status_code=400,
-                detail="Search query is required.",
-            )
-
-        matched_meetings = find_matching_meetings(
-            session=session,
-            query=request.query,
-        )
-
-        if not matched_meetings:
-            return {
-                "success": True,
-                "query": request.query,
-                "answer": {
-                    "question": request.query,
-                    "answer": "No matching meetings found.",
-                    "supporting_points": [],
-                },
-                "count": 0,
-                "results": [],
-            }
-
-        matched_meeting_objects = []
-
-        for item in matched_meetings:
-            meeting_id = item["meeting_id"]
-            meeting = session.get(Meeting, meeting_id)
-
-            if meeting:
-                matched_meeting_objects.append(meeting)
-
-        context_text = build_meeting_context(
-            session=session,
-            meetings=matched_meeting_objects,
-        )
-
-        answer = answer_meeting_question(
-            question=request.query,
-            context_text=context_text,
-        )
-
-        return {
-            "success": True,
-            "query": request.query,
-            "answer": answer,
-            "count": len(matched_meetings),
-            "results": matched_meetings,
-        }
-
-    except HTTPException:
-        raise
-
-    except ValueError as e:
-        raise HTTPException(
-            status_code=502,
-            detail=f"LLM response error: {str(e)}",
-        )
-
-    except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Meeting search failed: {str(e)}",
-        )
-
-
-@router.post("/followup-email")
-async def create_followup_email(
-    request: FollowupRequest,
-    session: Session = Depends(get_session),
-):
-    try:
-        meeting = session.get(Meeting, request.meeting_id)
-
-        if not meeting:
-            raise HTTPException(
-                status_code=404,
-                detail="Meeting not found.",
-            )
-
-        analysis = get_meeting_details(
-            session=session,
-            meeting_id=meeting.id,
-            include_chunks=False,
-            include_transcript=False,
-        )
-
-        email = generate_followup_email(
-            transcript=meeting.transcript,
-            analysis=analysis,
-        )
-
-        return {
-            "success": True,
-            "message": "Follow-up email generated successfully.",
-            "data": email,
-        }
-
-    except HTTPException:
-        raise
-
-    except ValueError as e:
-        raise HTTPException(
-            status_code=502,
-            detail=f"LLM response error: {str(e)}",
-        )
-
-    except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Follow-up email generation failed: {str(e)}",
-        )
-
-
-@router.post("/multi-meeting-insights")
-async def get_multi_meeting_insights(
-    request: MultiMeetingInsightRequest,
-    session: Session = Depends(get_session),
-):
-    try:
-        if not request.query or not request.query.strip():
-            raise HTTPException(
-                status_code=400,
-                detail="Insight query is required.",
-            )
-
-        if request.meeting_ids:
-            meetings = session.exec(
-                select(Meeting).where(Meeting.id.in_(request.meeting_ids))
-            ).all()
-        else:
-            meetings = session.exec(
-                select(Meeting).order_by(Meeting.id.desc()).limit(5)
-            ).all()
-
-        if not meetings:
-            raise HTTPException(
-                status_code=404,
-                detail="No meetings found for insight generation.",
-            )
-
-        unique_meetings = []
-        seen_hashes = set()
-
-        for meeting in meetings:
-            transcript_hash = get_transcript_hash(meeting.transcript)
-
-            if transcript_hash in seen_hashes:
-                continue
-
-            seen_hashes.add(transcript_hash)
-            unique_meetings.append(meeting)
-
-        meetings_context = build_meeting_context(
-            session=session,
-            meetings=unique_meetings,
-        )
-
-        insights = consolidate_meeting_insights(
-            meetings_context=meetings_context,
-            query=request.query,
-        )
-
-        return {
-            "success": True,
-            "message": "Multi-meeting insights generated successfully.",
-            "meeting_count": len(unique_meetings),
-            "meeting_titles": [
-                meeting.title or f"Meeting {meeting.id}"
-                for meeting in unique_meetings
-            ],
-            "data": insights,
-        }
-
-    except HTTPException:
-        raise
-
-    except ValueError as e:
-        raise HTTPException(
-            status_code=502,
-            detail=f"LLM response error: {str(e)}",
-        )
-
-    except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Multi-meeting insight generation failed: {str(e)}",
-        )
-
-
-@router.get("/{meeting_id}")
-def get_meeting(
-    meeting_id: int,
-    session: Session = Depends(get_session),
-):
-    return {
-        "success": True,
-        "data": get_meeting_details(
-            session=session,
-            meeting_id=meeting_id,
-            include_chunks=True,
-            include_transcript=True,
-        ),
-    }
-
-
-@router.delete("/{meeting_id}")
-def delete_meeting(
-    meeting_id: int,
-    session: Session = Depends(get_session),
-):
-    try:
-        meeting = session.get(Meeting, meeting_id)
-
-        if not meeting:
-            raise HTTPException(
-                status_code=404,
-                detail="Meeting not found.",
-            )
-
-        action_items = session.exec(
-            select(ActionItem).where(ActionItem.meeting_id == meeting_id)
-        ).all()
-
-        decisions = session.exec(
-            select(Decision).where(Decision.meeting_id == meeting_id)
-        ).all()
-
-        risks = session.exec(
-            select(Risk).where(Risk.meeting_id == meeting_id)
-        ).all()
-
-        chunks = session.exec(
-            select(TranscriptChunk).where(TranscriptChunk.meeting_id == meeting_id)
-        ).all()
-
-        for item in action_items:
-            session.delete(item)
-
-        for decision in decisions:
-            session.delete(decision)
-
-        for risk in risks:
-            session.delete(risk)
-
-        for chunk in chunks:
-            session.delete(chunk)
-
-        session.delete(meeting)
-        session.commit()
-
-        return {
-            "success": True,
-            "message": "Meeting deleted successfully.",
-        }
-
-    except HTTPException:
-        raise
-
-    except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Failed to delete meeting: {str(e)}",
-        )
