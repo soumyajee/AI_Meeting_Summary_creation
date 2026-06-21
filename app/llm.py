@@ -214,26 +214,38 @@ Transcript:
     return _chat_json(system_prompt, user_prompt)
 
 
-def consolidate_meeting_insights(meetings_context: str, query: str) -> Dict[str, Any]:
+def consolidate_meeting_insights(
+    meetings_context: str,
+    query: str,
+) -> Dict[str, Any]:
+    if not query or not query.strip():
+        raise ValueError("Query is empty.")
+
     if not meetings_context or not meetings_context.strip():
-        raise ValueError("Meetings context is empty")
+        raise ValueError("Meetings context is empty.")
 
     system_prompt = """
-You are an AI Meeting Assistant that generates insights across multiple meetings.
+You are an AI Meeting Assistant.
+
+You analyze multiple previous meetings and generate consolidated insights.
 
 Return ONLY valid JSON.
-Do not include markdown or explanation text.
+Do not include markdown.
+Do not include explanation text.
+Use only the provided meeting context.
 """
 
     user_prompt = f"""
-Generate consolidated insights across multiple meetings.
+Analyze the previous meetings and answer the user query.
 
-Return JSON using this structure:
+Return JSON in this exact structure:
 
 {{
   "query": "",
   "summary": "",
-  "recurring_risks": [],
+  "previous_discussions": [],
+  "planning_points": [],
+  "important_decisions": [],
   "pending_action_items": [
     {{
       "owner": "",
@@ -241,15 +253,22 @@ Return JSON using this structure:
       "meeting_reference": ""
     }}
   ],
-  "important_decisions": [],
+  "completed_action_items": [
+    {{
+      "owner": "",
+      "task": "",
+      "meeting_reference": ""
+    }}
+  ],
+  "recurring_risks": [],
+  "final_next_steps": [],
   "key_themes": []
 }}
-
 Query:
 {query}
 
-Meetings Context:
+Previous Meetings Context:
 {meetings_context}
 """
 
-    return _chat_json(system_prompt, user_prompt)
+    return chat_json(system_prompt, user_prompt)
